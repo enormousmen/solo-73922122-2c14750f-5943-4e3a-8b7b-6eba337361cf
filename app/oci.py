@@ -89,6 +89,45 @@ def digest_bytes(data: bytes) -> str:
 class HashStats:
     bytes_hashed: int
     chunks: int
+    computed_digest: str = ""
+
+
+@dataclass(frozen=True)
+class BlobScan:
+    """Facts produced by one complete chunked read of a layer blob.
+
+    No descriptor comparison has happened yet: callers compare these facts
+    against their own per-request descriptors.  That separation is what lets
+    several requests share one physical scan while each still validates its
+    own size/digest.
+    """
+
+    digest: str
+    size: int
+    chunks: int
+    computed_digest: str
+
+
+@dataclass(frozen=True)
+class LayerScanOutcome:
+    """A :class:`BlobScan` plus how this caller obtained it."""
+
+    scan: BlobScan
+    # "direct": no coordination; "leader": this caller ran the shared scan;
+    # "shared": served from a concurrent leader's scan; "takeover": the
+    # original leader died and this caller re-ran the scan.
+    role: str
+    session: str = ""
+
+
+@dataclass(frozen=True)
+class LayerScanReport:
+    """Per-layer entry carried back in :class:`VerifiedRelease`."""
+
+    digest: str
+    role: str
+    chunks: int
+    bytes_hashed: int
 
 
 @dataclass(frozen=True)
@@ -105,6 +144,7 @@ class VerifiedRelease:
     layer_bytes: int
     chunks: int
     elapsed_ms: float
+    layer_scans: tuple[LayerScanReport, ...] = ()
 
 
 @dataclass
@@ -163,33 +203,15 @@ class OciLayout:
             )
         return data
 
-    def hash_blob(
+    def _stream_hash(
         self,
-        digest: str,
+        path: Path,
         *,
-        expected_size: int,
         chunk_size: int,
         chunk_delay: float,
-    ) -> HashStats:
-        """Hash a blob in bounded chunks, checking its declared size.
-
-        Size is checked first via ``stat`` to fail fast on obvious mismatches,
-        then again while streaming so a truncated or growing file cannot slip
-        through.
-        """
-        path = self.blob_path(digest)
-        try:
-            actual_size = path.stat().st_size
-        except FileNotFoundError as exc:
-            raise ReleaseValidationError(
-                f"layer blob not found in local layout: {digest}", code="blob_not_found"
-            ) from exc
-        if actual_size != expected_size:
-            raise ReleaseValidationError(
-                f"layer {digest} descriptor size {expected_size} does not match blob size {actual_size}",
-                code="size_mismatch",
-            )
-
+        limit_bytes: int | None,
+        digest: str,
+    ) -> tuple[int, int, "hashlib._Hash"]:
         hasher = hashlib.sha256()
         total = 0
         chunks = 0
@@ -202,30 +224,99 @@ class OciLayout:
                     hasher.update(block)
                     total += len(block)
                     chunks += 1
-                    if total > expected_size:
+                    if limit_bytes is not None and total > limit_bytes:
                         raise ReleaseValidationError(
-                            f"layer {digest} grew beyond descriptor size {expected_size}",
+                            f"layer {digest} grew beyond descriptor size {limit_bytes}",
                             code="size_mismatch",
                         )
                     if chunk_delay:
                         time.sleep(chunk_delay)
+        except ReleaseValidationError:
+            raise
         except OSError as exc:
             raise ReleaseValidationError(
                 f"cannot read layer blob {digest}: {exc}", code="blob_unreadable"
             ) from exc
+        return total, chunks, hasher
 
-        if total != expected_size:
+    def scan_blob(
+        self,
+        digest: str,
+        *,
+        chunk_size: int,
+        chunk_delay: float,
+    ) -> BlobScan:
+        """Read and hash a whole layer blob once, reporting raw facts.
+
+        Unlike :meth:`hash_blob`, this never compares the result to a
+        descriptor: size and digest checks are the caller's independent
+        responsibility.  It delegates to :meth:`hash_blob` so that method
+        remains the single physical scan/instrumentation point.
+        """
+        stats = self.hash_blob(
+            digest,
+            expected_size=None,
+            chunk_size=chunk_size,
+            chunk_delay=chunk_delay,
+            verify_digest=False,
+        )
+        return BlobScan(
+            digest=digest,
+            size=stats.bytes_hashed,
+            chunks=stats.chunks,
+            computed_digest=stats.computed_digest,
+        )
+
+    def hash_blob(
+        self,
+        digest: str,
+        *,
+        expected_size: int | None,
+        chunk_size: int,
+        chunk_delay: float,
+        verify_digest: bool = True,
+    ) -> HashStats:
+        """Hash a blob in bounded chunks, checking its declared size.
+
+        Size is checked first via ``stat`` to fail fast on obvious mismatches,
+        then again while streaming so a truncated or growing file cannot slip
+        through.  When ``expected_size`` is ``None`` the size comparisons are
+        skipped (used by the shared scanner, which reports facts and lets each
+        request compare its own descriptor).
+        """
+        path = self.blob_path(digest)
+        try:
+            actual_size = path.stat().st_size
+        except FileNotFoundError as exc:
+            raise ReleaseValidationError(
+                f"layer blob not found in local layout: {digest}", code="blob_not_found"
+            ) from exc
+        if expected_size is not None and actual_size != expected_size:
+            raise ReleaseValidationError(
+                f"layer {digest} descriptor size {expected_size} does not match blob size {actual_size}",
+                code="size_mismatch",
+            )
+
+        total, chunks, hasher = self._stream_hash(
+            path,
+            chunk_size=chunk_size,
+            chunk_delay=chunk_delay,
+            limit_bytes=expected_size,
+            digest=digest,
+        )
+
+        if expected_size is not None and total != expected_size:
             raise ReleaseValidationError(
                 f"layer {digest} is {total} bytes, descriptor says {expected_size}",
                 code="size_mismatch",
             )
         computed = "sha256:" + hasher.hexdigest()
-        if computed != digest:
+        if verify_digest and computed != digest:
             raise ReleaseValidationError(
                 f"layer digest mismatch: descriptor {digest}, content {computed}",
                 code="digest_mismatch",
             )
-        return HashStats(bytes_hashed=total, chunks=chunks)
+        return HashStats(bytes_hashed=total, chunks=chunks, computed_digest=computed)
 
 
 def _descriptor(desc: Any, *, what: str) -> tuple[str, int, str]:
@@ -251,12 +342,23 @@ def verify_release(
     settings: Settings,
     architecture: str,
     manifest_digest: str,
+    *,
+    layer_scanner: Any | None = None,
 ) -> VerifiedRelease:
     """Verify a candidate manifest and everything it references.
 
     This function performs no state mutation and holds no release lock; it can
     run concurrently for different architectures (or for the same one) while
     the stable index stays queryable.
+
+    ``layer_scanner``, when supplied, must expose
+    ``scan_layer(layout, digest) -> LayerScanOutcome`` and provides
+    cross-request/cross-process single-flight sharing of the physical layer
+    scan.  Manifest, config and descriptor validation -- including the
+    descriptor size/digest comparison against the shared scan facts -- stays
+    per request, so one request's wrong size rejects only that request.
+    Without a scanner every layer is hashed directly with its descriptor size
+    checked up front (the legacy behaviour).
     """
     started = time.monotonic()
     manifest_digest = validate_digest(manifest_digest, what="manifest digest")
@@ -351,6 +453,7 @@ def verify_release(
 
     layer_bytes_total = 0
     chunk_total = 0
+    layer_reports: list[LayerScanReport] = []
     for position, layer in enumerate(layers):
         layer_digest, layer_size, layer_media_type = _descriptor(
             layer, what=f"layer[{position}]"
@@ -360,14 +463,47 @@ def verify_release(
                 f"layer[{position}] has unsupported mediaType: {layer_media_type}",
                 code="unsupported_media_type",
             )
-        stats = layout.hash_blob(
-            layer_digest,
-            expected_size=layer_size,
-            chunk_size=settings.layer_chunk_bytes,
-            chunk_delay=settings.layer_chunk_delay,
-        )
+        if layer_scanner is None:
+            stats = layout.hash_blob(
+                layer_digest,
+                expected_size=layer_size,
+                chunk_size=settings.layer_chunk_bytes,
+                chunk_delay=settings.layer_chunk_delay,
+            )
+            role = "direct"
+        else:
+            # One physical scan may be shared by a whole concurrent cohort.
+            # The descriptor comparison below is deliberately per request.
+            outcome: LayerScanOutcome = layer_scanner.scan_layer(layout, layer_digest)
+            facts = outcome.scan
+            role = outcome.role
+            if facts.size != layer_size:
+                raise ReleaseValidationError(
+                    f"layer {layer_digest} descriptor size {layer_size} does not "
+                    f"match blob size {facts.size}",
+                    code="size_mismatch",
+                )
+            if facts.computed_digest != layer_digest:
+                raise ReleaseValidationError(
+                    f"layer digest mismatch: descriptor {layer_digest}, "
+                    f"content {facts.computed_digest}",
+                    code="digest_mismatch",
+                )
+            stats = HashStats(
+                bytes_hashed=facts.size,
+                chunks=facts.chunks,
+                computed_digest=facts.computed_digest,
+            )
         layer_bytes_total += stats.bytes_hashed
         chunk_total += stats.chunks
+        layer_reports.append(
+            LayerScanReport(
+                digest=layer_digest,
+                role=role,
+                chunks=stats.chunks,
+                bytes_hashed=stats.bytes_hashed,
+            )
+        )
 
     platform: dict[str, str] = {"architecture": config_arch, "os": config_os}
     variant = config.get("variant")
@@ -411,4 +547,5 @@ def verify_release(
         layer_bytes=layer_bytes_total,
         chunks=chunk_total,
         elapsed_ms=elapsed_ms,
+        layer_scans=tuple(layer_reports),
     )

@@ -97,14 +97,37 @@ class LayoutBuilder:
                 {"mediaType": OCI_LAYER_GZIP, "digest": digest, "size": size}
             )
             diff_ids.append(diff_id)
+        return self.add_image_from_layers(
+            arch=arch,
+            version=version,
+            layer_descs=layer_descs,
+            diff_ids=diff_ids,
+            variant=variant,
+        )
 
+    def add_image_from_layers(
+        self,
+        *,
+        arch: str,
+        version: str,
+        layer_descs: list[dict[str, Any]],
+        diff_ids: list[str],
+        variant: str | None = None,
+        annotation_version: str | None = None,
+    ) -> dict[str, Any]:
+        """Assemble config/manifest/descriptor from pre-built layers.
+
+        Sharing the same ``layer_descs[0]`` between two calls is exactly how a
+        cross-architecture image reuses a resource layer.
+        """
+        version_label = annotation_version or version
         config: dict[str, Any] = {
             "architecture": arch,
             "os": "linux",
             "created": "1970-01-01T00:00:00Z",
             "config": {
                 "Env": ["PATH=/usr/local/bin:/usr/bin:/bin"],
-                "Labels": {"org.opencontainers.image.version": version},
+                "Labels": {"org.opencontainers.image.version": version_label},
                 "Cmd": ["/usr/local/bin/edge-agent"],
             },
             "rootfs": {"type": "layers", "diff_ids": diff_ids},
@@ -127,7 +150,7 @@ class LayoutBuilder:
             },
             "layers": layer_descs,
             "annotations": {
-                "org.opencontainers.image.version": version,
+                "org.opencontainers.image.version": version_label,
                 "org.opencontainers.image.ref.name": f"{arch}-{version}",
             },
         }
@@ -143,11 +166,25 @@ class LayoutBuilder:
             "size": manifest_size,
             "platform": platform,
             "annotations": {
-                "org.opencontainers.image.version": version,
+                "org.opencontainers.image.version": version_label,
             },
         }
         self.manifests[f"{arch}/{version}"] = descriptor
         return descriptor
+
+    def rewrite_manifest(
+        self, manifest_digest: str, mutate: Any, *, annotation_version: str | None = None
+    ) -> str:
+        """Clone a manifest blob through ``mutate(manifest)`` and write it."""
+        path = self.root / "blobs" / "sha256" / manifest_digest.split(":", 1)[1]
+        manifest = json.loads(path.read_bytes())
+        mutate(manifest)
+        if annotation_version is not None:
+            manifest.setdefault("annotations", {})[
+                "org.opencontainers.image.version"
+            ] = annotation_version
+        digest, _ = self.write_blob(canonical_json(manifest))
+        return digest
 
     def write_index(
         self,
@@ -250,11 +287,119 @@ def build_demo_layout(
     return meta
 
 
+def build_shared_demo_layout(
+    out_dir: Path,
+    meta_path: Path,
+    *,
+    shared_payload_bytes: int = 4 * 1024 * 1024,
+    amd64_payload_bytes: int = 2 * 1024 * 1024,
+    arm64_payload_bytes: int = 8 * 1024,
+) -> dict[str, Any]:
+    """Layout where amd64 and arm64 share one resource layer per version.
+
+    Each image has two layers:
+
+    * layer 0 is the *same* blob (same digest/size) for both architectures of
+      a given version -- the shared "resource" layer;
+    * layer 1 is architecture specific and keeps the slow-amd64/fast-arm64
+      shape used by the concurrency demo.
+
+    Also writes a deliberately wrong-size amd64 v2 manifest candidate under
+    ``mutations`` for the "wrong layer size rejects only that request" scene.
+    """
+    builder = LayoutBuilder(out_dir)
+    payloads = {"amd64": amd64_payload_bytes, "arm64": arm64_payload_bytes}
+    variants = {"amd64": None, "arm64": "v8"}
+    descriptors: dict[str, dict[str, dict[str, Any]]] = {}
+    shared_layers: dict[str, dict[str, Any]] = {}
+
+    for version in ("v1", "v2", "v3"):
+        descriptors[version] = {}
+        # Architecture-independent seed => byte-identical layer for both arches.
+        shared_blob, shared_diff_id = build_layer(
+            "shared-resources", version, 0, shared_payload_bytes
+        )
+        shared_digest, shared_size = builder.write_blob(shared_blob)
+        shared_desc = {
+            "mediaType": OCI_LAYER_GZIP,
+            "digest": shared_digest,
+            "size": shared_size,
+        }
+        shared_layers[version] = shared_desc
+
+        for arch in ("amd64", "arm64"):
+            arch_blob, arch_diff_id = build_layer(
+                arch, version, 1, payloads[arch]
+            )
+            arch_digest, arch_size = builder.write_blob(arch_blob)
+            arch_desc = {
+                "mediaType": OCI_LAYER_GZIP,
+                "digest": arch_digest,
+                "size": arch_size,
+            }
+            descriptors[version][arch] = builder.add_image_from_layers(
+                arch=arch,
+                version=version,
+                layer_descs=[dict(shared_desc), arch_desc],
+                diff_ids=[shared_diff_id, arch_diff_id],
+                variant=variants[arch],
+            )
+
+    # Wrong-size clone of the amd64 v2 manifest: same digests, bad layer[0].size.
+    good_amd_v2 = descriptors["v2"]["amd64"]["digest"]
+    actual_shared_size = shared_layers["v2"]["size"]
+    wrong_digest = builder.rewrite_manifest(
+        good_amd_v2,
+        lambda manifest: manifest["layers"][0].__setitem__(
+            "size", actual_shared_size + 7
+        ),
+        annotation_version="v2-wrong-size",
+    )
+
+    ref = "registry.example.com/edge/stable:latest"
+    preloaded = [descriptors["v1"]["amd64"], descriptors["v1"]["arm64"]]
+    written = builder.write_index(preloaded=preloaded, ref_name=ref, nested=True)
+
+    meta = {
+        "ref": ref,
+        "preloadedVersion": "v1",
+        "sharedLayers": shared_layers,
+        "versions": descriptors,
+        "mutations": {
+            "amd64V2WrongSharedLayerSize": {
+                "platform": "linux/amd64",
+                "digest": wrong_digest,
+                "expectedPreviousDigest": descriptors["v1"]["amd64"]["digest"],
+                "layerDigest": shared_layers["v2"]["digest"],
+                "actualSize": actual_shared_size,
+                "wrongSize": actual_shared_size + 7,
+            }
+        },
+        "indexDigest": written["indexDigest"],
+        "layout": str(out_dir),
+        "sharedLayerLayout": True,
+    }
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return meta
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="oci-layout", help="output layout directory")
     parser.add_argument(
         "--meta", default="examples/demo-digests.json", help="where to write digest metadata"
+    )
+    parser.add_argument(
+        "--shared",
+        action="store_true",
+        help="build the shared-resource-layer layout used by Docker Compose",
+    )
+    parser.add_argument(
+        "--shared-payload-bytes",
+        type=int,
+        default=4 * 1024 * 1024,
+        help="identical shared layer payload per version (--shared only)",
     )
     parser.add_argument(
         "--amd64-payload-bytes",
@@ -270,13 +415,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--layers", type=int, default=2, help="layers per image")
     args = parser.parse_args(argv)
-    meta = build_demo_layout(
-        Path(args.out),
-        Path(args.meta),
-        amd64_payload_bytes=args.amd64_payload_bytes,
-        arm64_payload_bytes=args.arm64_payload_bytes,
-        layers=args.layers,
-    )
+    if args.shared:
+        meta = build_shared_demo_layout(
+            Path(args.out),
+            Path(args.meta),
+            shared_payload_bytes=args.shared_payload_bytes,
+            amd64_payload_bytes=args.amd64_payload_bytes,
+            arm64_payload_bytes=args.arm64_payload_bytes,
+        )
+    else:
+        meta = build_demo_layout(
+            Path(args.out),
+            Path(args.meta),
+            amd64_payload_bytes=args.amd64_payload_bytes,
+            arm64_payload_bytes=args.arm64_payload_bytes,
+            layers=args.layers,
+        )
     print(json.dumps(meta["versions"], indent=2, sort_keys=True))
     print(f"wrote layout to {args.out} and metadata to {args.meta}")
     return 0

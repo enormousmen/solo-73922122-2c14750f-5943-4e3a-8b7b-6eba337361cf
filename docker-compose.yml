@@ -1,7 +1,8 @@
 name: edge-stable-release
 
 # One-shot job that writes a preloaded dual-architecture (amd64 + arm64) stable
-# index into the shared `oci-layout` volume.
+# index into the shared `oci-layout` volume.  The layout uses `--shared`, so the
+# two architectures' v2/v3 candidate images share one resource layer blob.
 services:
   layout-init:
     build:
@@ -25,9 +26,12 @@ services:
       OCI_INDEX_REF: registry.example.com/edge/stable:latest
       OCI_ARCHITECTURES: amd64,arm64
       LAYER_CHUNK_BYTES: "65536"
-      # Demo-only: stretch the layer scan so the concurrency demo is visible on
+      # Demo-only: stretch the layer scan so concurrent sharing is visible on
       # small demo layers. Set to 0 for real deployments.
-      LAYER_CHUNK_DELAY_MS: "1"
+      LAYER_CHUNK_DELAY_MS: "2"
+      # Waiters poll for the leader's atomically published scan result.
+      LAYER_SCAN_POLL_MS: "20"
+      LAYER_SCAN_WAIT_TIMEOUT_S: "120"
     volumes:
       # Read-only: the service can never mutate the image layout.
       - oci-layout:/oci-layout:ro

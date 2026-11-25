@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from .oci import (
     validate_digest,
     verify_release,
 )
+from .scans import LayerScanCoordinator, ScanCoordinationError, ScanStats
 from .store import ConflictError, StableStore, StoreError
 
 logger = logging.getLogger("release-api")
@@ -67,10 +69,19 @@ class ActiveRelease:
 
 
 class ReleaseService:
-    def __init__(self, settings: Settings, layout: OciLayout, store: StableStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        layout: OciLayout,
+        store: StableStore,
+        scanner: LayerScanCoordinator | None = None,
+        scan_stats: ScanStats | None = None,
+    ) -> None:
         self.settings = settings
         self.layout = layout
         self.store = store
+        self.scanner = scanner
+        self.scan_stats = scan_stats or ScanStats(settings.state_dir)
         self._active: dict[int, ActiveRelease] = {}
         self._active_lock = threading.Lock()
         self._next_token = 0
@@ -100,7 +111,10 @@ class ReleaseService:
 
 
 def _error(status: int, code: str, message: str, **details: Any) -> JSONResponse:
-    body: dict[str, Any] = {"error": {"code": code, "message": message}}
+    body: dict[str, Any] = {
+        "error": {"code": code, "message": message},
+        "workerPid": os.getpid(),
+    }
     if details:
         body["error"]["details"] = details
     return JSONResponse(status_code=status, content=body)
@@ -134,7 +148,13 @@ def create_app(
     settings = settings or Settings.from_env()
     layout = layout or OciLayout(settings.oci_layout)
     store = store or StableStore(settings, layout)
-    service = ReleaseService(settings, layout, store)
+    scan_stats = ScanStats(settings.state_dir)
+    scanner = (
+        LayerScanCoordinator(settings, scan_stats)
+        if settings.layer_scan_coalesce
+        else None
+    )
+    service = ReleaseService(settings, layout, store, scanner=scanner, scan_stats=scan_stats)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -161,6 +181,8 @@ def create_app(
     app.state.layout = layout
     app.state.store = store
     app.state.service = service
+    app.state.scanner = scanner
+    app.state.scan_stats = scan_stats
 
     @app.get("/healthz", summary="Liveness and readiness")
     def healthz() -> dict[str, Any]:
@@ -178,6 +200,22 @@ def create_app(
             "persisted": snapshot.persisted,
             "architectures": list(settings.architectures),
             "activeReleases": service.active(),
+            "layerScans": service.scan_stats.snapshot(),
+        }
+
+    @app.get("/v1/scans", summary="Layer scan counts and sharing state")
+    def get_scans() -> Any:
+        stats = service.scan_stats.snapshot()
+        sessions = scanner.active_sessions() if scanner is not None else []
+        return {
+            "pid": os.getpid(),
+            "coalescingEnabled": scanner is not None and scanner.enabled,
+            "pollMs": settings.scan_poll_seconds * 1000,
+            "waitTimeoutS": settings.scan_wait_timeout_seconds,
+            "statsFile": str(settings.state_dir / "layer-scan-stats.json"),
+            "stats": stats,
+            "activeLocal": scanner.active_local() if scanner is not None else [],
+            "sessions": sessions,
         }
 
     @app.get(
@@ -237,6 +275,7 @@ def create_app(
             "updatedAt": snapshot.updated_at,
             "published": published,
             "active": service.active(),
+            "layerScans": service.scan_stats.snapshot(),
         }
 
     @app.post(
@@ -260,7 +299,16 @@ def create_app(
         try:
             # Full verification happens outside the commit lock, so a slow
             # layer scan never blocks GET /v1/stable or the other architecture.
-            verified = verify_release(layout, settings, arch, manifest_digest)
+            # The scanner coalesces one physical read per shared layer across
+            # concurrent requests and worker processes; all manifest/config/
+            # descriptor checks still run independently inside verify_release.
+            verified = verify_release(
+                layout,
+                settings,
+                arch,
+                manifest_digest,
+                layer_scanner=service.scanner,
+            )
             if verified.platform != payload.platform:
                 return _error(
                     422,
@@ -279,10 +327,24 @@ def create_app(
             )
         except ReleaseValidationError as exc:
             return _error(422, exc.code, str(exc))
+        except ScanCoordinationError as exc:
+            return _error(503, "scan_unavailable", str(exc))
         except StoreError as exc:
             return _error(503, "state_unavailable", str(exc))
         finally:
             service.end(token)
+
+        layer_roles = [
+            {
+                "digest": item.digest,
+                "role": item.role,
+                "chunks": item.chunks,
+                "bytes": item.bytes_hashed,
+            }
+            for item in verified.layer_scans
+        ]
+        layers_scanned_here = sum(item["role"] in ("leader", "takeover", "direct") for item in layer_roles)
+        layers_shared_here = sum(item["role"] == "shared" for item in layer_roles)
 
         return JSONResponse(
             status_code=200,
@@ -290,6 +352,7 @@ def create_app(
                 "ref": settings.index_ref,
                 "revision": snapshot.revision,
                 "updatedAt": snapshot.updated_at,
+                "workerPid": os.getpid(),
                 "released": {
                     "platform": verified.platform,
                     "previousDigest": record["previousDigest"],
@@ -301,6 +364,9 @@ def create_app(
                         "layerBytes": verified.layer_bytes,
                         "chunks": verified.chunks,
                         "elapsedMs": verified.elapsed_ms,
+                        "layersScannedHere": layers_scanned_here,
+                        "layersSharedHere": layers_shared_here,
+                        "layerScans": layer_roles,
                     },
                 },
                 "stable": snapshot.index,

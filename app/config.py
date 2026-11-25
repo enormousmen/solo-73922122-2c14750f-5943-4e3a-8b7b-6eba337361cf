@@ -12,6 +12,11 @@ from pathlib import Path
 
 DEFAULT_ARCHITECTURES: tuple[str, ...] = ("amd64", "arm64")
 
+# How often a waiting process checks for the leader's result / lock release.
+DEFAULT_SCAN_POLL_SECONDS = 0.02
+# A held layer scan cannot take longer than this before waiters give up.
+DEFAULT_SCAN_WAIT_TIMEOUT_SECONDS = 120.0
+
 
 class ConfigError(ValueError):
     """Raised when the process environment is not usable."""
@@ -19,6 +24,17 @@ class ConfigError(ValueError):
 
 def _split(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _as_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError("expected a boolean (true/false/1/0)")
 
 
 @dataclass(frozen=True)
@@ -31,6 +47,9 @@ class Settings:
     architectures: tuple[str, ...] = DEFAULT_ARCHITECTURES
     layer_chunk_bytes: int = 64 * 1024
     layer_chunk_delay: float = 0.0
+    layer_scan_coalesce: bool = True
+    scan_poll_seconds: float = DEFAULT_SCAN_POLL_SECONDS
+    scan_wait_timeout_seconds: float = DEFAULT_SCAN_WAIT_TIMEOUT_SECONDS
     allowed_media_types: tuple[str, ...] = field(
         default_factory=lambda: (
             "application/vnd.oci.image.manifest.v1+json",
@@ -47,6 +66,9 @@ class Settings:
         raw_ref = env.get("OCI_INDEX_REF", "registry.example.com/edge/stable:latest")
         raw_chunk = env.get("LAYER_CHUNK_BYTES", str(64 * 1024))
         raw_chunk_delay = env.get("LAYER_CHUNK_DELAY_MS", "0")
+        raw_coalesce = env.get("LAYER_SCAN_COALESCE", "true")
+        raw_scan_poll_ms = env.get("LAYER_SCAN_POLL_MS", "20")
+        raw_scan_wait_s = env.get("LAYER_SCAN_WAIT_TIMEOUT_S", "120")
 
         architectures = tuple(_split(raw_archs))
         if not architectures:
@@ -71,6 +93,25 @@ class Settings:
         if not 0 <= chunk_delay_ms <= 1000:
             raise ConfigError("LAYER_CHUNK_DELAY_MS must be between 0 and 1000")
 
+        try:
+            coalesce = _as_bool(raw_coalesce, True)
+        except ConfigError as exc:
+            raise ConfigError(f"LAYER_SCAN_COALESCE {exc}") from exc
+
+        try:
+            scan_poll_ms = float(raw_scan_poll_ms)
+        except ValueError as exc:
+            raise ConfigError("LAYER_SCAN_POLL_MS must be numeric") from exc
+        if not 1 <= scan_poll_ms <= 60000:
+            raise ConfigError("LAYER_SCAN_POLL_MS must be between 1 and 60000")
+
+        try:
+            scan_wait_timeout_s = float(raw_scan_wait_s)
+        except ValueError as exc:
+            raise ConfigError("LAYER_SCAN_WAIT_TIMEOUT_S must be numeric") from exc
+        if not 1 <= scan_wait_timeout_s <= 3600:
+            raise ConfigError("LAYER_SCAN_WAIT_TIMEOUT_S must be between 1 and 3600")
+
         if not raw_ref.strip() or any(c.isspace() for c in raw_ref):
             raise ConfigError("OCI_INDEX_REF must be a non-empty reference without spaces")
 
@@ -81,6 +122,9 @@ class Settings:
             architectures=architectures,
             layer_chunk_bytes=chunk,
             layer_chunk_delay=chunk_delay_ms / 1000.0,
+            layer_scan_coalesce=coalesce,
+            scan_poll_seconds=scan_poll_ms / 1000.0,
+            scan_wait_timeout_seconds=scan_wait_timeout_s,
         )
 
     def media_type_allowed(self, media_type: object) -> bool:

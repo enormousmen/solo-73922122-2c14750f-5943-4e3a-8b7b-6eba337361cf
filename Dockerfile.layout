@@ -6,11 +6,14 @@ FROM python:3.11-slim
 WORKDIR /srv
 COPY scripts ./scripts
 
-# amd64 candidate layers are deliberately larger than arm64 so that the amd64
-# scan is visibly slower in the concurrency demo.  The preloaded v1 images are
-# the same size on both architectures apart from this payload knob.
+# `--shared` makes amd64 and arm64 v1/v2/v3 images share one byte-identical
+# resource layer per version, which is what the scan-coalescing demo measures.
+# The amd64-specific layer is deliberately much larger than arm64's so the
+# existing concurrency demo still shows a slow amd64 scan and a fast arm64 one.
 CMD ["python", "scripts/build_layout.py", \
+     "--shared", \
      "--out", "/oci-layout", \
      "--meta", "/oci-layout/demo-digests.json", \
-     "--amd64-payload-bytes", "2097152", \
+     "--shared-payload-bytes", "4194304", \
+     "--amd64-payload-bytes", "8388608", \
      "--arm64-payload-bytes", "8192"]

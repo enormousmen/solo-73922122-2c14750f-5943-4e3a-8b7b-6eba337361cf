@@ -124,6 +124,7 @@ The index is untouched. Retry with the current digest to succeed.
 | 422 | `unsupported_media_type` | manifest/config/layer media type not allowed |
 | 409 | `conflict` | `expectedPreviousDigest` no longer matches the stable index |
 | 503 | `state_unavailable` | durable state is unreadable/unwritable |
+| 503 | `scan_unavailable` | waited too long for another process's layer scan |
 
 ## 7. Restart behaviour
 
@@ -136,3 +137,24 @@ $ curl -s localhost:8000/v1/stable | jq '.manifests[].digest'
 
 The last successful release is served from `/state/stable-index.json`; a failed
 release never overwrites it.
+
+## 8. Shared layer scan counts
+
+With the `--shared` demo layout, amd64 and arm64 candidate images share one
+resource-layer blob. Concurrent releases scan that blob once per overlapping
+cohort across both uvicorn workers. `GET /v1/scans` shows the cumulative
+cross-process counters:
+
+```console
+$ curl -s localhost:8000/v1/scans | jq '.stats | {scans, shared, takeovers}'
+{"scans": 9, "shared": 2, "takeovers": 0}
+```
+
+Each release response reports the per-layer role in
+`released.verified.layerScans`: `leader`, `shared`, `takeover` or `direct`.
+A manifest with a wrong layer `size` gets `422 size_mismatch` for that request
+only; the concurrent good request still shares the single scan and commits.
+After a scan cohort ends, the next release starts a fresh cohort and reads the
+layer again. Full measured output and the crash-takeover scene are in
+[`shared-layers.md`](shared-layers.md); runnable via
+`examples/demo_shared_layers.py`.
